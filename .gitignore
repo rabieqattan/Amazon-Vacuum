@@ -1,0 +1,56 @@
+# Environment variables
+.env
+.env.local
+config_local.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+*.xlsx
+*.xls
+output/
+logs/
+
+# API Keys and sensitive data
+*.key
+*.pem
+credentials.json
+API_KEY
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CSV files (if processing locally)
+# ASIN.csv
+# Uncomment above if you don't want to commit CSV files
