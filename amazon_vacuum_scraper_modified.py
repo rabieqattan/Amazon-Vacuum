@@ -152,9 +152,19 @@ class AmazonVacuumCollector:
                 print(f"  ⚠️ No product data for {asin}")
                 return None
 
-            # Extract price info
-            price_info = product.get("prices", [{}])[0] if product.get("prices") else {}
+            # Extract price info (Rainforest API returns the live price under
+            # buybox_winner.price, not a top-level "prices" list)
+            price_info = product.get("buybox_winner", {}).get("price") or product.get("price") or {}
             price = price_info.get("raw", "N/A")
+
+            # Extract brand (top-level field, falling back to the specifications table)
+            brand = product.get("brand")
+            if not brand:
+                for spec in product.get("specifications", []):
+                    if spec.get("name") in ("Brand", "Brand Name"):
+                        brand = spec.get("value")
+                        break
+            brand = brand or "N/A"
 
             # Extract seller info from page using Selenium
             print(f"    Extracting seller info for {asin}...", end=" ")
@@ -162,6 +172,7 @@ class AmazonVacuumCollector:
             print(f"✓")
 
             product_info = {
+                "Brand": brand,
                 "ASIN": asin,
                 "Title": product.get("title", "N/A"),
                 "Price": price,
@@ -169,7 +180,7 @@ class AmazonVacuumCollector:
                 "Fulfilled by": fulfilled_by,
                 "Sold by": sold_by,
                 "Shipper/Seller": shipper_seller,
-                "Specs": product.get("description", "")[:500],
+                "Specs": product.get("specifications_flat") or product.get("description", ""),
                 "Rating": product.get("rating", "N/A"),
                 "Reviews": product.get("ratings_total", 0),
                 "URL": f"https://www.amazon.ae/dp/{asin}"
@@ -255,7 +266,7 @@ class AmazonVacuumCollector:
         # Create All Products Sheet
         products_sheet = wb.create_sheet("All Products", 1)
 
-        headers = ["ASIN", "Title", "Price", "Currency", "Fulfilled by", "Sold by", "Shipper/Seller", "Rating", "Reviews", "URL"]
+        headers = ["Brand", "ASIN", "Title", "Price", "Currency", "Fulfilled by", "Sold by", "Shipper/Seller", "Specs", "Rating", "Reviews", "URL"]
         products_sheet.append(headers)
 
         # Format header row
@@ -270,6 +281,7 @@ class AmazonVacuumCollector:
         # Add product data
         for product in self.all_products:
             products_sheet.append([
+                product["Brand"],
                 product["ASIN"],
                 product["Title"],
                 product["Price"],
@@ -277,22 +289,25 @@ class AmazonVacuumCollector:
                 product["Fulfilled by"],
                 product["Sold by"],
                 product["Shipper/Seller"],
+                product["Specs"],
                 product["Rating"],
                 product["Reviews"],
                 product["URL"]
             ])
 
         # Set column widths
-        products_sheet.column_dimensions['A'].width = 12
-        products_sheet.column_dimensions['B'].width = 40
-        products_sheet.column_dimensions['C'].width = 12
-        products_sheet.column_dimensions['D'].width = 10
-        products_sheet.column_dimensions['E'].width = 20
+        products_sheet.column_dimensions['A'].width = 15
+        products_sheet.column_dimensions['B'].width = 12
+        products_sheet.column_dimensions['C'].width = 40
+        products_sheet.column_dimensions['D'].width = 12
+        products_sheet.column_dimensions['E'].width = 10
         products_sheet.column_dimensions['F'].width = 20
         products_sheet.column_dimensions['G'].width = 20
-        products_sheet.column_dimensions['H'].width = 10
-        products_sheet.column_dimensions['I'].width = 10
-        products_sheet.column_dimensions['J'].width = 45
+        products_sheet.column_dimensions['H'].width = 20
+        products_sheet.column_dimensions['I'].width = 50
+        products_sheet.column_dimensions['J'].width = 10
+        products_sheet.column_dimensions['K'].width = 10
+        products_sheet.column_dimensions['L'].width = 45
 
         # Freeze header row
         products_sheet.freeze_panes = "A2"
