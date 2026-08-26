@@ -1,6 +1,11 @@
 import requests
 import time
 import csv
+import os
+import threading
+import subprocess
+import platform
+import config
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -8,6 +13,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
+
+# Hard wall-clock cap on a single Selenium page extraction. Selenium's own
+# page_load_timeout doesn't help if chromedriver/Chrome itself wedges (e.g. a
+# crashed renderer chromedriver never notices) -- the HTTP call to chromedriver
+# can then hang forever with no timeout of its own. Running the extraction in
+# a daemon thread lets us give up after this many seconds and force-kill the
+# stuck browser instead of blocking the whole run.
+SELENIUM_TIMEOUT = 45
 
 class AmazonVacuumCollector:
     def __init__(self, api_key, csv_file_path):
@@ -54,11 +67,42 @@ class AmazonVacuumCollector:
             options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
 
             self.driver = webdriver.Chrome(options=options)
+            self.driver.set_page_load_timeout(30)
             print("✓ Selenium WebDriver initialized")
         except Exception as e:
             print(f"⚠️ Warning: Could not initialize Selenium: {str(e)}")
             print("  Seller info will be set to 'Not Available'")
             self.driver = None
+
+    def _force_kill_driver(self):
+        """
+        Kill the chromedriver/Chrome process tree directly instead of calling
+        driver.quit(), which sends an HTTP command through the same channel
+        that may be the thing that's wedged.
+        """
+        if self.driver:
+            try:
+                pid = self.driver.service.process.pid
+            except Exception:
+                pid = None
+            if pid:
+                try:
+                    if platform.system() == "Windows":
+                        subprocess.run(
+                            ["taskkill", "/F", "/T", "/PID", str(pid)],
+                            capture_output=True, timeout=10
+                        )
+                    else:
+                        import signal
+                        os.kill(pid, signal.SIGKILL)
+                except Exception:
+                    pass
+        self.driver = None
+
+    def _restart_selenium(self):
+        """Recover from a wedged browser: force-kill it and start a fresh session."""
+        self._force_kill_driver()
+        self._init_selenium()
 
     def extract_seller_info_from_page(self, asin):
         """
@@ -68,12 +112,12 @@ class AmazonVacuumCollector:
         if not self.driver:
             return "Not Available", "Not Available", "Not Available"
 
-        try:
+        def _extract():
             url = f"https://www.amazon.ae/dp/{asin}"
             self.driver.get(url)
 
             # Wait for page to load
-            WebDriverWait(self.driver, 10).until(
+            WebDriverWait(self.driver, config.WAIT_TIMEOUT).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             time.sleep(1)
@@ -123,24 +167,55 @@ class AmazonVacuumCollector:
                         else:
                             shipper_seller = next_line[:100] if next_line else "Not Available"
 
-            return fulfilled_by, sold_by, shipper_seller
+            outcome['value'] = (fulfilled_by, sold_by, shipper_seller)
 
-        except Exception as e:
-            print(f"  ⚠️ Error extracting seller info for {asin}: {str(e)}")
+        outcome = {}
+
+        def _run():
+            try:
+                _extract()
+            except Exception as e:
+                outcome['error'] = str(e)
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(timeout=SELENIUM_TIMEOUT)
+
+        if worker.is_alive():
+            print(f"  ⚠️ Selenium wedged on {asin} (no response after {SELENIUM_TIMEOUT}s), restarting browser...")
+            self._restart_selenium()
             return "Not Available", "Not Available", "Not Available"
 
-    def fetch_product_details(self, asin):
-        """Fetch product details from Rainforest API"""
-        try:
-            params = {
-                "api_key": self.api_key,
-                "amazon_domain": "amazon.ae",
-                "type": "product",
-                "asin": asin
-            }
+        if 'error' in outcome:
+            print(f"  ⚠️ Error extracting seller info for {asin}: {outcome['error']}")
+            return "Not Available", "Not Available", "Not Available"
 
-            response = requests.get(self.base_url, params=params, timeout=30)
-            response.raise_for_status()
+        return outcome.get('value', ("Not Available", "Not Available", "Not Available"))
+
+    def fetch_product_details(self, asin):
+        """Fetch product details from Rainforest API, retrying transient network errors"""
+        params = {
+            "api_key": self.api_key,
+            "amazon_domain": "amazon.ae",
+            "type": "product",
+            "asin": asin
+        }
+
+        response = None
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                response = requests.get(self.base_url, params=params, timeout=30)
+                response.raise_for_status()
+                break
+            except requests.exceptions.RequestException as e:
+                if attempt < config.MAX_RETRIES:
+                    print(f"  ⚠️ Network error for {asin} (attempt {attempt}/{config.MAX_RETRIES}): {str(e)}, retrying...")
+                    time.sleep(2)
+                else:
+                    print(f"  ⚠️ Network error for {asin}: {str(e)}")
+                    return None
+
+        try:
             data = response.json()
 
             if not data.get("request_info", {}).get("success"):
@@ -153,9 +228,14 @@ class AmazonVacuumCollector:
                 return None
 
             # Extract price info (Rainforest API returns the live price under
-            # buybox_winner.price, not a top-level "prices" list)
+            # buybox_winner.price, not a top-level "prices" list). Use the
+            # numeric "value" rather than "raw" so Price stays a sortable
+            # number in Excel instead of duplicating the Currency column
+            # (raw looks like "AED1,031.00"). Some ASINs genuinely have no
+            # live buybox price (out of stock / no qualifying offer) -- N/A
+            # in that case reflects Rainforest's data, not a parsing bug.
             price_info = product.get("buybox_winner", {}).get("price") or product.get("price") or {}
-            price = price_info.get("raw", "N/A")
+            price = price_info.get("value", "N/A")
 
             # Extract brand (top-level field, falling back to the specifications table)
             brand = product.get("brand")
@@ -216,7 +296,7 @@ class AmazonVacuumCollector:
                 print("✗ Failed")
 
             # Respectful delay to avoid rate limiting
-            time.sleep(1)
+            time.sleep(config.REQUEST_DELAY)
 
         print(f"\n✅ Total products collected: {len(self.all_products)}/{len(self.asins)}")
         return self.all_products
@@ -318,15 +398,20 @@ class AmazonVacuumCollector:
         return output_filename
 
     def close(self):
-        """Clean up Selenium driver"""
-        if self.driver:
-            self.driver.quit()
-            print("\n✓ Browser closed")
+        """Clean up Selenium driver, force-killing it if quit() itself hangs"""
+        if not self.driver:
+            return
+        worker = threading.Thread(target=self.driver.quit, daemon=True)
+        worker.start()
+        worker.join(timeout=15)
+        if worker.is_alive():
+            self._force_kill_driver()
+        print("\n✓ Browser closed")
 
 def main():
-    # Configuration
-    API_KEY = "AECB78A27B374B34A2F037C3A6E1AA3B"
-    CSV_FILE_PATH = "ASIN.csv"  # Path to your CSV file with filtered ASINs
+    # Configuration (from .env / environment via config.py, with fallbacks)
+    API_KEY = config.RAINFOREST_API_KEY
+    CSV_FILE_PATH = config.CSV_FILE_PATH
 
     collector = None
     try:
@@ -339,7 +424,9 @@ def main():
         collector.collect_all_products()
 
         if collector.all_products:
-            output_file = collector.create_excel_file()
+            os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+            output_path = os.path.join(config.OUTPUT_DIR, config.OUTPUT_FILENAME)
+            output_file = collector.create_excel_file(output_path)
             print(f"\n🎉 SUCCESS! File ready: {output_file}")
             print("="*70)
             print("Features:")
