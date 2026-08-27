@@ -447,12 +447,29 @@ class AmazonVacuumCollector:
             self._force_kill_driver()
         print("\n✓ Browser closed")
 
+def _week_stamped_filename(base_filename):
+    """
+    Insert an ISO year-week stamp (e.g. "_2026-W35") before the extension, so
+    each week's scheduled run produces its own distinct, chronologically
+    sortable file instead of overwriting the same name every time.
+
+    Deliberately a week stamp, not a calendar date: this task can span more
+    than one day (a slow run plus a --retry-failed pass has already taken
+    1.5+ days in practice), and a date stamp would make --retry-failed fail
+    to find "today's" file if it's run the next day. An ISO week (Mon-Sun)
+    stays stable across that whole span as long as the run started Monday,
+    which matches the weekly Monday-8AM schedule this task runs on.
+    """
+    name, ext = os.path.splitext(base_filename)
+    iso_year, iso_week, _ = datetime.now().isocalendar()
+    return f"{name}_{iso_year}-W{iso_week:02d}{ext}"
+
 def main():
     # Configuration (from .env / environment via config.py, with fallbacks)
     API_KEY = config.RAINFOREST_API_KEY
     CSV_FILE_PATH = config.CSV_FILE_PATH
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    output_path = os.path.join(config.OUTPUT_DIR, config.OUTPUT_FILENAME)
+    output_path = os.path.join(config.OUTPUT_DIR, _week_stamped_filename(config.OUTPUT_FILENAME))
 
     # --retry-failed: instead of re-fetching all 108 ASINs, only fetch the
     # ones missing from the existing output file (whether they hard-failed
