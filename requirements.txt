@@ -2,3 +2,4 @@ requests==2.31.0
 selenium==4.15.2
 openpyxl==3.1.5
 python-dotenv==1.0.0
+pandas==3.0.5
