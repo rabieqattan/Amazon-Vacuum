@@ -2,6 +2,7 @@ import requests
 import time
 import csv
 import os
+import sys
 import threading
 import subprocess
 import platform
@@ -10,7 +11,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
 
@@ -34,6 +35,9 @@ class AmazonVacuumCollector:
         self.driver = None
         self._init_selenium()
         self._load_asins_from_csv()
+        # Fixed at load time so the Summary sheet stays accurate even when
+        # self.asins is later narrowed down to a retry-only subset.
+        self.total_asins_in_csv = len(self.asins)
 
     def _load_asins_from_csv(self):
         """Load ASINs from CSV file"""
@@ -188,6 +192,19 @@ class AmazonVacuumCollector:
 
         if 'error' in outcome:
             print(f"  ⚠️ Error extracting seller info for {asin}: {outcome['error']}")
+            # A crashed/disconnected browser leaves self.driver pointing at a
+            # dead session -- every subsequent ASIN would silently fail the
+            # same way for the rest of the run unless we restart here too
+            # (not just on the hang/timeout path above).
+            error_lower = outcome['error'].lower()
+            dead_session_markers = (
+                "invalid session id", "chrome not reachable", "disconnected",
+                "session deleted", "no such window", "target window already closed",
+                "unable to connect", "connection refused",
+            )
+            if any(marker in error_lower for marker in dead_session_markers):
+                print(f"  ⚠️ Browser session appears dead, restarting...")
+                self._restart_selenium()
             return "Not Available", "Not Available", "Not Available"
 
         return outcome.get('value', ("Not Available", "Not Available", "Not Available"))
@@ -301,6 +318,28 @@ class AmazonVacuumCollector:
         print(f"\n✅ Total products collected: {len(self.all_products)}/{len(self.asins)}")
         return self.all_products
 
+    @staticmethod
+    def load_products_from_excel(xlsx_path):
+        """
+        Read an existing output file's "All Products" sheet back into a list
+        of product dicts, keyed by the same headers create_excel_file writes.
+        Used by --retry-failed to merge newly-recovered ASINs into a prior run
+        without re-fetching everything that already succeeded.
+        """
+        products = []
+        if not os.path.exists(xlsx_path):
+            return products
+
+        wb = load_workbook(xlsx_path)
+        if "All Products" not in wb.sheetnames:
+            return products
+
+        ws = wb["All Products"]
+        headers = [cell.value for cell in ws[1]]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            products.append(dict(zip(headers, row)))
+        return products
+
     def create_excel_file(self, output_filename="Amazon_Vacuum_Cleaners_Filtered.xlsx"):
         """Create Excel workbook with product data"""
         print(f"\n📝 Creating Excel file: {output_filename}")
@@ -330,7 +369,7 @@ class AmazonVacuumCollector:
 
         summary_data = [
             ["Total Products Collected", len(self.all_products)],
-            ["Total ASINs in CSV", len(self.asins)],
+            ["Total ASINs in CSV", self.total_asins_in_csv],
             ["Collection Date", datetime.now().strftime('%Y-%m-%d')],
             ["Collection Time", datetime.now().strftime('%H:%M:%S')],
             ["Avg Rating", f"{sum([float(p['Rating']) if isinstance(p['Rating'], (int, float)) else 0 for p in self.all_products]) / len(self.all_products) if self.all_products else 0:.1f}"]
@@ -412,6 +451,13 @@ def main():
     # Configuration (from .env / environment via config.py, with fallbacks)
     API_KEY = config.RAINFOREST_API_KEY
     CSV_FILE_PATH = config.CSV_FILE_PATH
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    output_path = os.path.join(config.OUTPUT_DIR, config.OUTPUT_FILENAME)
+
+    # --retry-failed: instead of re-fetching all 108 ASINs, only fetch the
+    # ones missing from the existing output file (whether they hard-failed
+    # or the run was interrupted before reaching them), then merge into it.
+    retry_mode = "--retry-failed" in sys.argv
 
     collector = None
     try:
@@ -421,11 +467,29 @@ def main():
             print("\n❌ No ASINs loaded from CSV file. Exiting.")
             return
 
+        if retry_mode:
+            existing_products = collector.load_products_from_excel(output_path)
+            existing_asins = {p.get("ASIN") for p in existing_products}
+            missing_asins = [a for a in collector.asins if a not in existing_asins]
+
+            if not missing_asins:
+                print(f"\n✅ All {collector.total_asins_in_csv} ASINs already present in {output_path} -- nothing to retry.")
+                return
+
+            print(f"\n🔁 Retry mode: {len(existing_products)} product(s) already in {output_path}, retrying {len(missing_asins)} missing ASIN(s)...")
+            collector.asins = missing_asins
+            collector.collect_all_products()
+
+            collector.all_products = existing_products + collector.all_products
+            output_file = collector.create_excel_file(output_path)
+            recovered = len(collector.all_products) - len(existing_products)
+            print(f"\n🎉 Retry complete. Recovered {recovered}/{len(missing_asins)}.")
+            print(f"   Total products now: {len(collector.all_products)}/{collector.total_asins_in_csv}. File: {output_file}")
+            return
+
         collector.collect_all_products()
 
         if collector.all_products:
-            os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-            output_path = os.path.join(config.OUTPUT_DIR, config.OUTPUT_FILENAME)
             output_file = collector.create_excel_file(output_path)
             print(f"\n🎉 SUCCESS! File ready: {output_file}")
             print("="*70)
@@ -435,6 +499,9 @@ def main():
             print("  ✅ 3-column seller info extraction")
             print("  ✅ Summary sheet with collection stats")
             print("="*70)
+            missing = collector.total_asins_in_csv - len(collector.all_products)
+            if missing:
+                print(f"  ⚠️ {missing} ASIN(s) failed to collect -- rerun with --retry-failed to fill the gaps")
         else:
             print("\n❌ No products were collected. Please check your CSV file and API key.")
 
